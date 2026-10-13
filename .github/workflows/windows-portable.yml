@@ -1,0 +1,72 @@
+name: TyreTrack V9.1 Windows Portable Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-compat:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python 3.12 x64
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: 'x64'
+      - name: Install pinned compatible CPU PyTorch
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install torch==2.5.1+cpu torchvision==0.20.1+cpu --index-url https://download.pytorch.org/whl/cpu
+      - name: Install application and packaging dependencies
+        run: |
+          python -m pip install -r requirements-compat.txt
+          python -m pip check
+      - name: Validate source and model
+        run: |
+          python -m py_compile TyreTrack_Production_Monitor.py count_line.py hourly_dashboard.py learning_centre.py management_portal.py tyretrack_cloud_sync.py BUILD_V5_COMPAT.py
+          python -c "import torch, torchvision, depthai; from ultralytics import YOLO; print('torch',torch.__version__,'torchvision',torchvision.__version__,'model',YOLO('tyre_detector.pt').task)"
+          python tyretrack_report_sync_test.py
+      - name: Build and run torch probe and V5 startup checks
+        id: build
+        continue-on-error: true
+        run: |
+          python BUILD_V5_COMPAT.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Print diagnostic outputs
+        if: always()
+        run: |
+          Get-ChildItem -Path build -Recurse -File -Include '*_output.txt','warn-TyreTrack.txt','warn-torch_probe.txt' -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host "===== $($_.FullName) ====="
+            Get-Content -LiteralPath $_.FullName | Select-Object -Last 120
+          }
+      - name: Upload diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: TyreTrack-V9-1-Diagnostics
+          path: |
+            build/**/*_output.txt
+            build/**/warn-TyreTrack.txt
+            build/**/warn-torch_probe.txt
+          if-no-files-found: warn
+      - name: Upload portable V5 application
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: TyreTrack-V9-1-Windows-Portable
+          path: releases/TyreTrack_V9_1_Compat_*/
+          compression-level: 0
+          if-no-files-found: error
+      - name: Mark failed startup
+        if: steps.build.outcome != 'success'
+        run: |
+          Write-Error 'Compatibility build failed; inspect Print diagnostic outputs or download diagnostics artifact.'
+          exit 1
