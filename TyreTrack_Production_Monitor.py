@@ -7,6 +7,10 @@
 # Requires on-site validation; does not change detector weights.
 
 import configparser
+import hashlib
+import hmac
+import secrets
+import json
 import webbrowser
 import csv
 import math
@@ -86,14 +90,17 @@ from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
 from learning_centre import LearningCentre
 from management_portal import launch as launch_management_portal, sync_incidents as sync_management_incidents
 from tyretrack_cloud_sync import publish as publish_management_cloud
-from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPixmap
+from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QIcon
 from PyQt5.QtWidgets import (
     QApplication,
+    QSystemTrayIcon,
+    QMenu,
     QCheckBox,
     QComboBox,
     QLineEdit,
     QTextEdit,
     QDialog,
+    QInputDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -784,6 +791,7 @@ def oak_no_count_alert_tick():
     sent = send_message(
         "TYRETRACK Alert - No OAK counts for 10 minutes",
         "TYRECYCLE | TYRETRACK\n\n"
+        f"Alert triggered: {datetime.now(timezone(timedelta(hours=10))):%Y-%m-%d %H:%M:%S} Brisbane (UTC+10)\n"
         "No OAK tyre counts have been recorded for at least "
         "10 minutes while OAK frames were being received.\n\n"
         f"Checked: {datetime.now():%Y-%m-%d %H:%M} "
@@ -2128,6 +2136,53 @@ class VideoLabel(QLabel):
         self.drag_mode = None
 
 
+# Administrator and operator-adjustable settings live outside the executable.
+ADMIN_FILE = PRIVATE_CONFIG_DIR / "admin_security.json"
+OPERATOR_SETTINGS_FILE = PRIVATE_CONFIG_DIR / "operator_settings.json"
+TEMP_ADMIN_PASSWORD = "TyreTrack@2026!"
+DEFAULT_OPERATOR_SETTINGS = {"low_flow_threshold": 5.0}
+
+
+def _password_hash(password, salt):
+    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"),
+                              bytes.fromhex(salt), 250_000).hex()
+
+
+def _read_admin():
+    if not ADMIN_FILE.exists():
+        salt = secrets.token_hex(16)
+        record = {"salt": salt, "hash": _password_hash(TEMP_ADMIN_PASSWORD, salt),
+                  "temporary": True}
+        ADMIN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        ADMIN_FILE.write_text(json.dumps(record, indent=2), encoding="utf-8")
+    return json.loads(ADMIN_FILE.read_text(encoding="utf-8"))
+
+
+def _verify_admin(password):
+    record = _read_admin()
+    return hmac.compare_digest(_password_hash(password, record["salt"]), record["hash"])
+
+
+def _set_admin_password(password):
+    salt = secrets.token_hex(16)
+    ADMIN_FILE.write_text(json.dumps({"salt": salt,
+                                       "hash": _password_hash(password, salt),
+                                       "temporary": False}, indent=2), encoding="utf-8")
+
+
+def _load_operator_settings():
+    settings = DEFAULT_OPERATOR_SETTINGS.copy()
+    if OPERATOR_SETTINGS_FILE.exists():
+        try:
+            saved = json.loads(OPERATOR_SETTINGS_FILE.read_text(encoding="utf-8"))
+            threshold = float(saved.get("low_flow_threshold", 5))
+            if 0 < threshold <= 100:
+                settings["low_flow_threshold"] = threshold
+        except (ValueError, TypeError, OSError, json.JSONDecodeError):
+            log("Invalid operator settings; using defaults")
+    return settings
+
+
 class Main(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -2152,7 +2207,11 @@ class Main(QMainWindow):
         self.fullscreen_video = None
         self.session = 0
         self.test_events = []  # Video playback seconds at confirmed crossings.
-        self.learning = LearningCentre(DATA)
+        self.learning = None  # Disabled: preserve saved review files; avoid live-frame overhead.
+        self._explicit_exit = False
+        self.operator_settings = _load_operator_settings()
+        _read_admin()
+        self._flow_flash = False
         self.management_server = None
         self.management_url = None
 
@@ -2161,7 +2220,19 @@ class Main(QMainWindow):
         )
         self.resize(1450, 850)
         self.build_ui()
+        self.tray = QSystemTrayIcon(self)
+        self.tray.setIcon(self.style().standardIcon(self.style().SP_ComputerIcon))
+        self.tray.setToolTip("TyreTrack — counting continues in background")
+        menu = QMenu(self)
+        show_action = menu.addAction("Show TyreTrack")
+        show_action.triggered.connect(self.showNormal)
+        quit_action = menu.addAction("Exit TyreTrack (stop counting)")
+        quit_action.triggered.connect(self.exit_application)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(lambda reason: self.showNormal() if reason == QSystemTrayIcon.DoubleClick else None)
+        self.tray.show()
         self.refresh_counts()
+        QTimer.singleShot(0, self.first_launch_password_change)
 
         self.oak_preview_timer = QTimer(self)
         self.oak_preview_timer.setInterval(
@@ -2260,7 +2331,7 @@ class Main(QMainWindow):
         self.truck_lbl = QLabel("0")  # Reserved for future truck classification.
         self.session_lbl = QLabel("0")
         self.no_count_lbl = QLabel("0")
-        self.flow_lbl = QLabel("0.0/min")
+        self.flow_lbl = QLabel("0.0 tyres/min")
         self.gap_lbl = QLabel("0 min")
         self.production_status_lbl = QLabel("WAITING")
         self.hour_lbl = QLabel("0")
@@ -2302,16 +2373,27 @@ class Main(QMainWindow):
         self.session_lbl.setStyleSheet("color:#38D996;font-size:38px;font-weight:900;")
         self.best_hour_card.setToolTip("Highest completed production hour (Brisbane time)")
         summary.addWidget(self.best_hour_card, 2)
+        self.best_day_lbl = QLabel("0")
+        self.best_day_card = metric_card("BEST DAILY TOTAL", self.best_day_lbl, "#42B7FF")
+        self.best_day_card.setToolTip("Highest completed OAK production shift, Brisbane time")
+        summary.addWidget(self.best_day_card, 2)
         counters_layout.addLayout(summary)
 
         monitor = QHBoxLayout()
         monitor.setSpacing(8)
-        for title, label in (("FLOW RATE", self.flow_lbl),
+        for title, label in (("FLOW RATE · TYRES/MIN", self.flow_lbl),
                              ("NO COUNT ALERTS", self.no_count_lbl),
                              ("NO-FLOW TIME", self.gap_lbl),
                              ("PRODUCTION STATUS", self.production_status_lbl)):
             monitor.addWidget(metric_card(title, label, "#FF5C68" if title in ("NO COUNT ALERTS", "NO-FLOW TIME") else None), 1)
         counters_layout.addLayout(monitor)
+        self.no_count_time_lbl = QLabel("No-count alert: none")
+        self.no_count_time_lbl.setStyleSheet("color:#FFB9BE;font-size:12px;")
+        counters_layout.addWidget(self.no_count_time_lbl)
+        self.flow_flash_timer = QTimer(self)
+        self.flow_flash_timer.setInterval(650)
+        self.flow_flash_timer.timeout.connect(self.flash_low_flow)
+        self.flow_flash_timer.start()
 
         classes = QHBoxLayout()
         classes.setSpacing(8)
@@ -2324,10 +2406,10 @@ class Main(QMainWindow):
         production = QHBoxLayout()
         production.setSpacing(8)
         self.production_average = QLabel("0")
-        self.production_flow_best = QLabel("0.0/min")
+        self.production_flow_best = QLabel("0.0 tyres/min")
         for heading, label, colour in (
             ("AVERAGE HOURLY PRODUCTION", self.production_average, "#38D996"),
-            ("BEST FLOW AVERAGE TODAY", self.production_flow_best, "#42B7FF"),
+            ("BEST AVERAGE FLOW · TYRES/MIN", self.production_flow_best, "#42B7FF"),
         ):
             tile = metric_card(heading, label, colour)
             label.setStyleSheet("color:"+colour+";font-size:26px;font-weight:900;")
@@ -2391,10 +2473,13 @@ class Main(QMainWindow):
         )
         self.stop_btn.setObjectName("stop")
         self.stop_btn.setEnabled(False)
-        self.stop_btn.clicked.connect(self.stop)
+        self.stop_btn.clicked.connect(self.request_stop)
 
         run_row.addWidget(self.start_btn)
         run_row.addWidget(self.stop_btn)
+        settings_btn = QPushButton("ADMIN SETTINGS")
+        settings_btn.clicked.connect(self.show_admin_settings)
+        run_row.addWidget(settings_btn)
         left.addLayout(run_row)
 
         self.status_lbl = QLabel(
@@ -2444,7 +2529,7 @@ class Main(QMainWindow):
         line_tab = tab_page("COUNTING")
         reports_tab = tab_page("REPORTS")
         hours_tab = tab_page("PERFORMANCE")
-        learn_tab = tab_page("LEARNING")
+        # Learning tab removed to keep live OAK preview lightweight.
         management_tab = tab_page("MANAGEMENT")
         management_card, management_layout = self.card("MANAGEMENT PORTAL · STOPPAGE REASONS")
         management_layout.addWidget(QLabel("View recorded 10-minute stoppages and supervisor explanations.\nOnly reasons are editable on the management webpage."))
@@ -2461,41 +2546,15 @@ class Main(QMainWindow):
         management_tab.addWidget(management_card)
         management_tab.addStretch()
         self.refresh_management_reasons()
-        learning_card, learning_layout = self.card("AI LEARNING CENTRE · REVIEW ONLY")
-        learning_layout.addWidget(QLabel("Live OAK clips: 10 sec before + 10 sec after.\nReview labels do not change live counts or model weights."))
-        self.learning_save_btn = QPushButton("SAVE 20-SECOND INCIDENT CLIP")
-        self.learning_save_btn.clicked.connect(self.save_learning_clip)
-        learning_layout.addWidget(self.learning_save_btn)
-        self.learning_status = QLabel("Waiting for live OAK frames")
-        self.learning_status.setWordWrap(True)
-        learning_layout.addWidget(self.learning_status)
-        self.learning_incidents = QComboBox()
-        learning_layout.addWidget(self.learning_incidents)
-        refresh_learning = QPushButton("REFRESH SAVED INCIDENTS")
-        refresh_learning.clicked.connect(self.refresh_learning_incidents)
-        learning_layout.addWidget(refresh_learning)
-        learning_layout.addWidget(QLabel("Actual tyres in clip (operator verified)"))
-        self.learning_actual = QLineEdit()
-        self.learning_actual.setPlaceholderText("Enter verified tyre count")
-        learning_layout.addWidget(self.learning_actual)
-        self.learning_notes = QTextEdit()
-        self.learning_notes.setPlaceholderText("Explain overlap, missed detection, tracking issue...")
-        self.learning_notes.setMaximumHeight(85)
-        learning_layout.addWidget(self.learning_notes)
-        approve = QPushButton("SAVE HUMAN REVIEW")
-        approve.clicked.connect(self.save_learning_review)
-        learning_layout.addWidget(approve)
-        learn_tab.addWidget(learning_card)
+        # Retain the local management portal on the MANAGEMENT tab.
         manage_card, manage_layout = self.card("MANAGEMENT STOPPAGE REASONS")
-        manage_layout.addWidget(QLabel("Private local web form for management to explain stoppages.\nRemote phone access requires secure network setup."))
+        manage_layout.addWidget(QLabel("Private local web form for stoppage reasons."))
         portal_button = QPushButton("START LOCAL MANAGEMENT PAGE")
         portal_button.clicked.connect(self.start_management_page)
         manage_layout.addWidget(portal_button)
         self.management_status = QLabel("Not started")
-        self.management_status.setWordWrap(True)
         manage_layout.addWidget(self.management_status)
-        learn_tab.addWidget(manage_card)
-        self.refresh_learning_incidents()
+        management_tab.addWidget(manage_card)
 
         source_card, source_layout = self.card(
             "01  CAMERA & VIDEO SOURCE"
@@ -3059,9 +3118,6 @@ class Main(QMainWindow):
         if isinstance(value, tuple):
             frame, emitted_at = value
 
-        self.learning.ingest(frame, live=bool(
-            self.worker is not None and self.worker.isRunning() and self.worker.source_kind == "oak"
-        ))
         self.video.set_frame(frame)
 
         if self.fullscreen_video is not None:
@@ -3135,7 +3191,6 @@ class Main(QMainWindow):
             return
         self._oak_preview_sequence = sequence
         # Review-only event detection: never changes track IDs or counts.
-        self.learning.observe_boxes(detections, live=True)
         if mode == "Bounding Boxes":
             draw_detections(frame, detections)
         elif mode == "Segmentation Mask" and result is not None:
@@ -3358,6 +3413,84 @@ class Main(QMainWindow):
                 str(exc),
             )
 
+    def admin_auth(self, action):
+        password, ok = QInputDialog.getText(
+            self, "Administrator authorization", f"Enter administrator password to {action}:",
+            QLineEdit.Password)
+        if not ok:
+            return False
+        if not _verify_admin(password):
+            QMessageBox.warning(self, "Access denied",
+                                "Incorrect administrator password. Counting continues.")
+            return False
+        return True
+
+    def first_launch_password_change(self):
+        if not _read_admin().get("temporary", False):
+            return
+        QMessageBox.information(
+            self, "Administrator setup",
+            "This installation uses a temporary administrator password. "
+            "You must replace it before protected controls can be used.")
+        if self.admin_auth("set your private password"):
+            self.change_admin_password()
+
+    def change_admin_password(self):
+        password, ok = QInputDialog.getText(
+            self, "Change administrator password", "New password (at least 12 characters):",
+            QLineEdit.Password)
+        if not ok:
+            return
+        if len(password) < 12:
+            QMessageBox.warning(self, "Password too short", "Use at least 12 characters.")
+            return
+        confirm, ok = QInputDialog.getText(
+            self, "Confirm password", "Repeat new password:", QLineEdit.Password)
+        if not ok or password != confirm:
+            QMessageBox.warning(self, "Not changed", "Passwords did not match.")
+            return
+        _set_admin_password(password)
+        QMessageBox.information(self, "Password updated", "Administrator password updated.")
+
+    def show_admin_settings(self):
+        if not self.admin_auth("open settings"):
+            return
+        threshold, ok = QInputDialog.getDouble(
+            self, "Low-flow warning setting",
+            "Flash warning when flow is at or below (tyres/min):",
+            float(self.operator_settings["low_flow_threshold"]), 0.1, 100.0, 1)
+        if ok:
+            self.operator_settings["low_flow_threshold"] = threshold
+            OPERATOR_SETTINGS_FILE.write_text(
+                json.dumps(self.operator_settings, indent=2), encoding="utf-8")
+            QMessageBox.information(
+                self, "Settings saved",
+                "Low-flow threshold saved outside the executable. No rebuild needed.")
+        if QMessageBox.question(self, "Administrator password",
+                                "Change administrator password now?",
+                                QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+            self.change_admin_password()
+
+    def request_stop(self):
+        if not self.admin_auth("stop counting"):
+            return
+        reason, ok = QInputDialog.getText(
+            self, "Stop reason", "Reason for stopping (required):")
+        if not ok or not reason.strip():
+            QMessageBox.information(self, "Stop cancelled", "A reason is required.")
+            return
+        self.record_admin_stop("STOP COUNTING", reason.strip())
+        self.stop()
+
+    def record_admin_stop(self, action, reason):
+        path = DATA / "admin_stop_history.csv"
+        first = not path.exists()
+        with path.open("a", encoding="utf-8", newline="") as stream:
+            writer = csv.writer(stream)
+            if first:
+                writer.writerow(["brisbane_timestamp", "action", "reason"])
+            writer.writerow([brisbane_now().isoformat(), action, reason])
+
     def stop(self):
         if self.worker is not None:
             self.worker.stop()
@@ -3457,7 +3590,7 @@ class Main(QMainWindow):
         # Best sustained flow measured across completed hourly slots, including zero-count hours.
         flow = max((slot['count'] / max((slot['end'] - slot['start']).total_seconds() / 60, 1/60)
                     for slot in completed_slots), default=0.0)
-        self.production_flow_best.setText(f"{flow:.2f}/min")
+        self.production_flow_best.setText(f"{flow:.2f} tyres/min")
         self.session_lbl.setText(str(best['count'] if best else 0))
         if best:
             if test_mode:
@@ -3524,7 +3657,7 @@ class Main(QMainWindow):
                          for i in range(13) if elapsed >= min((i+1)*3600,43500)]
             # Best-hour count is refreshed from completed slots below.
             self.no_count_lbl.setText(str(len(gaps)))
-            self.flow_lbl.setText(f"{last_five / max(1/60, min(300, max(elapsed,1))) * 60:.1f}/min")
+            self.flow_lbl.setText(f"{last_five / max(1/60, min(300, max(elapsed,1))) * 60:.1f} tyres/min")
             self.gap_lbl.setText(f"{sum(gaps)/60:.0f} min")
             self.production_status_lbl.setText("TEST · NO COUNT" if elapsed >= 600 and (trailing >= 600 or not events) else "TEST MODE")
             self.all_time_lbl.setText("TEST SESSION  " + str(len(events)))
@@ -3538,7 +3671,7 @@ class Main(QMainWindow):
             self.total_lbl.setText(str(metrics["all_time"]))
             # Best-hour count is refreshed from completed slots below.
             self.no_count_lbl.setText(str(metrics["no_count_incidents"]))
-            self.flow_lbl.setText(f"{metrics['flow_per_minute']:.1f}/min")
+            self.flow_lbl.setText(f"{metrics['flow_per_minute']:.1f} tyres/min")
             self.gap_lbl.setText(f"{metrics['no_flow_minutes']:.0f} min")
             self.production_status_lbl.setText(metrics["no_count_status"])
             self.all_time_lbl.setText("ALL TIME  " + str(metrics["all_time"]))
@@ -3553,6 +3686,14 @@ class Main(QMainWindow):
             self.passenger_lbl.setText(str(class_totals['passenger']))
             self.suv_lbl.setText(str(class_totals['4x4']))
             self.refresh_production_hours()
+        self._flow_value = float(metrics["flow_per_minute"]) if not test_mode else None
+        self._flow_monitoring = bool(not test_mode and worker is not None and
+            worker.source_kind == "oak" and worker.isRunning() and
+            metrics["no_count_status"] in ("RUNNING", "NO COUNT", "WAITING"))
+        if time.monotonic() >= getattr(self, "_next_history_refresh", 0):
+            self._next_history_refresh = time.monotonic() + 30
+            self.refresh_best_day()
+            self.refresh_no_count_timestamp(test_mode)
         self.gap_lbl.setStyleSheet("color:#FF5C68;font-size:22px;font-weight:900;")
         self.no_count_lbl.setStyleSheet("color:#FF5C68;font-size:22px;font-weight:900;")
         alert = "NO COUNT" in self.production_status_lbl.text()
@@ -3759,34 +3900,92 @@ class Main(QMainWindow):
             )
             self.email_thread.start()
 
+    def flash_low_flow(self):
+        if not getattr(self, "_flow_monitoring", False) or getattr(self, "_flow_value", 999) > self.operator_settings["low_flow_threshold"]:
+            self.flow_lbl.setStyleSheet("")
+            return
+        self._flow_flash = not self._flow_flash
+        self.flow_lbl.setStyleSheet(
+            "background:#B91C1C;color:white;font-size:22px;font-weight:900;"
+            if self._flow_flash else "background:#45151A;color:#FFB4B4;font-size:22px;font-weight:900;")
+
+    def refresh_best_day(self):
+        # Completed Brisbane shifts only. Source restricted to live OAK counts.
+        try:
+            now = brisbane_now()
+            today_start = now.replace(hour=5, minute=0, second=0, microsecond=0)
+            with sqlite3.connect(DB, timeout=15) as con:
+                stamps = con.execute("SELECT metric_utc FROM counts WHERE source=? AND metric_utc IS NOT NULL", (OAK_NAME,)).fetchall()
+            days = {}
+            for (epoch,) in stamps:
+                dt = datetime.fromtimestamp(epoch, now.tzinfo)
+                start = dt.replace(hour=5, minute=0, second=0, microsecond=0)
+                if dt < start:
+                    start -= timedelta(days=1)
+                if (start > today_start or (start == today_start and now < start + timedelta(hours=12, minutes=5))) or not start <= dt < start + timedelta(hours=12, minutes=5):
+                    continue
+                key = start.date().isoformat()
+                days[key] = days.get(key, 0) + 1
+            date, count = max(days.items(), key=lambda item:item[1]) if days else ("No completed shift", 0)
+            self.best_day_lbl.setText(f"{count:,}")
+            self.best_day_card.setToolTip(f"Best completed shift: {date} · {count:,} tyres · Brisbane")
+        except Exception as exc:
+            log(f"Best day dashboard failed: {exc}")
+
+    def refresh_no_count_timestamp(self, test_mode):
+        if test_mode:
+            self.no_count_time_lbl.setText("No-count timestamps: production only (video test)")
+            return
+        try:
+            sync_management_incidents(DB)
+            with sqlite3.connect(DB, timeout=15) as con:
+                row = con.execute("SELECT started,ended,duration_seconds,status FROM no_count_incidents ORDER BY started DESC LIMIT 1").fetchone()
+            if row:
+                started, ended, seconds, status = row
+                self.no_count_time_lbl.setText(
+                    f"NO COUNT · Started {started[:19].replace('T',' ')} Brisbane · "
+                    f"{seconds//60} min · {status}" +
+                    (f" · Recovered {ended[:19].replace('T',' ')}" if ended else ""))
+            else:
+                self.no_count_time_lbl.setText("No-count alert: none recorded")
+        except Exception as exc:
+            log(f"No-count timestamp display failed: {exc}")
+
+    def exit_application(self):
+        if not self.admin_auth("exit TyreTrack"):
+            return
+        reason, ok = QInputDialog.getText(
+            self, "Exit reason", "Reason for exiting (required):")
+        if not ok or not reason.strip():
+            return
+        self.record_admin_stop("EXIT TYRETRACK", reason.strip())
+        self._explicit_exit = True
+        self.close()
+
     def closeEvent(self, event):
+        if not self._explicit_exit and self.tray.isVisible():
+            event.ignore()
+            self.hide()
+            self.tray.showMessage("TyreTrack running", "Counting continues in the background. Double-click the tray icon to reopen.", QSystemTrayIcon.Information, 3500)
+            return
         self.oak_preview_timer.stop()
-
-        if (
-            self.worker is not None
-            and self.worker.isRunning()
-        ):
+        if self.worker is not None and self.worker.isRunning():
             self.worker.stop()
-
             if not self.worker.wait(15000):
-                QMessageBox.warning(
-                    self,
-                    "Still stopping",
-                    "The detector has not finished "
-                    "its current frame. Wait, then "
-                    "close the app again.",
-                )
+                QMessageBox.warning(self, "Still stopping", "The detector is still stopping. Try Exit again.")
                 if self.worker.source_kind == "oak":
                     self.oak_preview_timer.start()
+                self._explicit_exit = False
                 event.ignore()
                 return
-
+        self.tray.hide()
         event.accept()
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    app.setQuitOnLastWindowClosed(False)
 
     window = Main()
     window.show()
