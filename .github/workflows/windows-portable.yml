@@ -62,7 +62,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: TyreTrack-V9-1-Windows-Portable
-          path: releases/TyreTrack_V9_1_Compat_*/
+          path: path: releases/TyreTrack_V9_2_Sound_Alerts_*/
           compression-level: 0
           if-no-files-found: error
       - name: Mark failed startup
