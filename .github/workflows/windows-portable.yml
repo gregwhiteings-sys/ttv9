@@ -1,4 +1,5 @@
-name: TyreTrack V9.1 Windows Portable Build
+
+name: TyreTrack V9.2 Windows Portable Build
 
 on:
   workflow_dispatch:
@@ -8,65 +9,103 @@ permissions:
 
 jobs:
   windows-compat:
+    name: Build TyreTrack V9.2
     runs-on: windows-latest
     timeout-minutes: 120
+
     defaults:
       run:
         shell: pwsh
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
+
       - name: Set up Python 3.12 x64
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           architecture: 'x64'
-      - name: Install pinned compatible CPU PyTorch
+
+      - name: Check required sound files
+        run: |
+          $required = @(
+            "sounds/low_flow_voice.wav"
+            "sounds/best_hour_voice.wav"
+            "sounds/best_hour_cheer.wav"
+          )
+          foreach ($file in $required) {
+            if (-not (Test-Path $file)) {
+              throw "Missing required sound file: $file"
+            }
+            Write-Host "FOUND: $file"
+          }
+
+      - name: Install compatible CPU PyTorch
         run: |
           python -m pip install --upgrade pip setuptools wheel
           python -m pip install torch==2.5.1+cpu torchvision==0.20.1+cpu --index-url https://download.pytorch.org/whl/cpu
-      - name: Install application and packaging dependencies
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Install application dependencies
         run: |
           python -m pip install -r requirements-compat.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m pip check
-      - name: Validate source and model
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Validate Python source
         run: |
           python -m py_compile TyreTrack_Production_Monitor.py count_line.py hourly_dashboard.py learning_centre.py management_portal.py tyretrack_cloud_sync.py BUILD_V5_COMPAT.py
-          python -c "import torch, torchvision, depthai; from ultralytics import YOLO; print('torch',torch.__version__,'torchvision',torchvision.__version__,'model',YOLO('tyre_detector.pt').task)"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify detector and PyTorch
+        run: |
+          python -c "import torch, torchvision, depthai; from ultralytics import YOLO; model=YOLO('tyre_detector.pt'); print('TORCH:',torch.__version__); print('TORCHVISION:',torchvision.__version__); print('MODEL:',model.task); assert model.task == 'segment'"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run regression tests
+        run: |
           python tyretrack_report_sync_test.py
-      - name: Build and run torch probe and V5 startup checks
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build Windows portable application
         id: build
         continue-on-error: true
         run: |
           python BUILD_V5_COMPAT.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Print diagnostic outputs
+
+      - name: Print diagnostic logs
         if: always()
         run: |
           Get-ChildItem -Path build -Recurse -File -Include '*_output.txt','warn-TyreTrack.txt','warn-torch_probe.txt' -ErrorAction SilentlyContinue | ForEach-Object {
             Write-Host "===== $($_.FullName) ====="
             Get-Content -LiteralPath $_.FullName | Select-Object -Last 120
           }
-      - name: Upload diagnostic logs
+
+      - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: TyreTrack-V9-1-Diagnostics
+          name: TyreTrack-V9-2-Diagnostics
           path: |
             build/**/*_output.txt
             build/**/warn-TyreTrack.txt
             build/**/warn-torch_probe.txt
           if-no-files-found: warn
-      - name: Upload portable V5 application
+
+      - name: Upload Windows portable application
         if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: TyreTrack-V9-1-Windows-Portable
-          path: path: releases/TyreTrack_V9_2_Sound_Alerts_*/
+          name: TyreTrack-V9-2-Windows-Portable
+          path: releases/TyreTrack_V9_2_Sound_Alerts_*/
           compression-level: 0
           if-no-files-found: error
-      - name: Mark failed startup
+
+      - name: Fail workflow if build failed
         if: steps.build.outcome != 'success'
         run: |
-          Write-Error 'Compatibility build failed; inspect Print diagnostic outputs or download diagnostics artifact.'
+          Write-Error "TyreTrack build failed. Review the diagnostic logs."
           exit 1
