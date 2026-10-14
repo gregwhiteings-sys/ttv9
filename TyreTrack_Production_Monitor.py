@@ -3215,10 +3215,7 @@ class Main(QMainWindow):
 
         detections = ()
         mode = self.overlay_mode_combo.currentText()
-        # Always fetch inference metadata for learning events, even when the
-        # operator hides bounding boxes. Keep inference and preview independent.
-        overlay = worker.latest_oak_overlay()
-               # Clean preview uses newest OAK-D camera frame.
+        # Clean preview uses newest OAK-D camera frame.
         # AI counting continues independently.
         if mode not in ("Bounding Boxes", "Segmentation Mask"):
             frame, sequence, captured_at = worker.oak_source.preview_snapshot()
