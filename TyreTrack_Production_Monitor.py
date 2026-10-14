@@ -3218,12 +3218,19 @@ class Main(QMainWindow):
         # Always fetch inference metadata for learning events, even when the
         # operator hides bounding boxes. Keep inference and preview independent.
         overlay = worker.latest_oak_overlay()
-        if overlay is not None:
-            captured_at, sequence, dimensions, detections, processed_frame, result = overlay
-            frame = processed_frame.copy()
-        else:
+               # Clean preview uses newest OAK-D camera frame.
+        # AI counting continues independently.
+        if mode not in ("Bounding Boxes", "Segmentation Mask"):
             frame, sequence, captured_at = worker.oak_source.preview_snapshot()
             result = None
+        else:
+            overlay = worker.latest_oak_overlay()
+            if overlay is not None:
+                captured_at, sequence, dimensions, detections, processed_frame, result = overlay
+                frame = processed_frame.copy()
+            else:
+                frame, sequence, captured_at = worker.oak_source.preview_snapshot()
+                result = None
         if frame is None or sequence == self._oak_preview_sequence:
             return
         self._oak_preview_sequence = sequence
