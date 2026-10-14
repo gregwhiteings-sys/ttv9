@@ -7,7 +7,7 @@ ROOT=Path(__file__).resolve().parent
 STAMP=datetime.now().strftime('%Y%m%d_%H%M%S')
 STAGE=ROOT/'build'/('v5_compat_'+STAMP)
 BUNDLE=STAGE/'dist'/'TyreTrack'
-RELEASE=ROOT/'releases'/('TyreTrack_V9_1_Compat_'+STAMP)
+RELEASE=ROOT/'releases'/('TyreTrack_V9_2_Sound_Alerts_'+STAMP)
 
 def run(*args):
     cmd=[str(x) for x in args]
@@ -91,6 +91,16 @@ def main():
         raise RuntimeError('Detector hash mismatch or duplicate')
     if list(BUNDLE.rglob('email_config.ini')):raise RuntimeError('Private email config found')
     for name in ('data','reports'):(BUNDLE/name).mkdir(exist_ok=True)
+    # External sounds are editable after packaging; never freeze them into the EXE.
+    sounds_source = ROOT / 'sounds'
+    if not sounds_source.is_dir():
+        raise RuntimeError('Missing sounds directory')
+    required_sounds = ('low_flow_voice.wav', 'best_hour_cheer.wav', 'best_hour_voice.wav')
+    for filename in required_sounds:
+        if not (sounds_source / filename).is_file():
+            raise RuntimeError('Missing sound asset: ' + filename)
+    shutil.copytree(sounds_source, BUNDLE / 'sounds', dirs_exist_ok=True)
+
     check_exe(exe,BUNDLE,'startup',12)
     RELEASE.parent.mkdir(exist_ok=True)
     shutil.move(str(BUNDLE),str(RELEASE))

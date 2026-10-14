@@ -18,6 +18,7 @@ import numpy as np
 import os
 import shutil
 import smtplib
+import subprocess
 import sqlite3
 import sys
 import threading
@@ -2140,7 +2141,7 @@ class VideoLabel(QLabel):
 ADMIN_FILE = PRIVATE_CONFIG_DIR / "admin_security.json"
 OPERATOR_SETTINGS_FILE = PRIVATE_CONFIG_DIR / "operator_settings.json"
 TEMP_ADMIN_PASSWORD = "TyreTrack@2026!"
-DEFAULT_OPERATOR_SETTINGS = {"low_flow_threshold": 5.0}
+DEFAULT_OPERATOR_SETTINGS = {"low_flow_threshold": 5.0, "low_flow_sound_enabled": True, "best_hour_sound_enabled": True, "alert_volume": 75}
 
 
 def _password_hash(password, salt):
@@ -2178,9 +2179,42 @@ def _load_operator_settings():
             threshold = float(saved.get("low_flow_threshold", 5))
             if 0 < threshold <= 100:
                 settings["low_flow_threshold"] = threshold
+            for key in ("low_flow_sound_enabled", "best_hour_sound_enabled"):
+                if isinstance(saved.get(key), bool):
+                    settings[key] = saved[key]
+            settings["alert_volume"] = max(0, min(100, int(saved.get("alert_volume", 75))))
         except (ValueError, TypeError, OSError, json.JSONDecodeError):
             log("Invalid operator settings; using defaults")
     return settings
+
+
+def play_windows_alert(kind, volume):
+    """Play replaceable WAV assets; fall back to Windows beeps.
+    Called from a daemon thread so camera processing stays responsive.
+    """
+    if sys.platform != "win32" or volume <= 0:
+        return
+    try:
+        import winsound
+        sound_dir = app_dir() / "sounds"
+        names = (["low_flow_voice.wav"] if kind == "low"
+                 else ["best_hour_cheer.wav", "best_hour_voice.wav"])
+        found = False
+        for name in names:
+            wav = sound_dir / name
+            if wav.is_file():
+                found = True
+                winsound.PlaySound(str(wav), winsound.SND_FILENAME)
+        if not found:
+            if kind == "low":
+                for _ in range(3):
+                    winsound.Beep(850, 150)
+                    time.sleep(0.12)
+            else:
+                winsound.Beep(1000, 150)
+                winsound.Beep(1250, 200)
+    except Exception as exc:
+        log(f"Sound alert unavailable: {exc}")
 
 
 class Main(QMainWindow):
@@ -2212,6 +2246,9 @@ class Main(QMainWindow):
         self.operator_settings = _load_operator_settings()
         _read_admin()
         self._flow_flash = False
+        self._low_flow_last_sound = 0.0
+        self._best_hour_seen = {"oak": None, "video": None}
+        self._best_flash_until = 0.0
         self.management_server = None
         self.management_url = None
 
@@ -3466,6 +3503,27 @@ class Main(QMainWindow):
             QMessageBox.information(
                 self, "Settings saved",
                 "Low-flow threshold saved outside the executable. No rebuild needed.")
+        for key, question in (
+            ("low_flow_sound_enabled", "Enable low-flow warning beeps?"),
+            ("best_hour_sound_enabled", "Enable best-hour celebration voice?"),
+        ):
+            answer = QMessageBox.question(
+                self, "Sound alerts", question, QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes if self.operator_settings[key] else QMessageBox.No)
+            self.operator_settings[key] = answer == QMessageBox.Yes
+        volume, ok = QInputDialog.getInt(
+            self, "Sound volume", "Voice volume (0-100):",
+            int(self.operator_settings["alert_volume"]), 0, 100)
+        if ok:
+            self.operator_settings["alert_volume"] = volume
+        OPERATOR_SETTINGS_FILE.write_text(
+            json.dumps(self.operator_settings, indent=2), encoding="utf-8")
+        if QMessageBox.question(self, "Test warning", "Play low-flow beeps now?",
+                                QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+            self.play_alert("low", test=True)
+        if QMessageBox.question(self, "Test celebration", "Play best-hour announcement now?",
+                                QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+            self.play_alert("best", test=True)
         if QMessageBox.question(self, "Administrator password",
                                 "Change administrator password now?",
                                 QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
@@ -3592,6 +3650,7 @@ class Main(QMainWindow):
                     for slot in completed_slots), default=0.0)
         self.production_flow_best.setText(f"{flow:.2f} tyres/min")
         self.session_lbl.setText(str(best['count'] if best else 0))
+        self.check_best_hour_celebration(best['count'] if best else 0, test_mode)
         if best:
             if test_mode:
                 a = 5 * 3600 + best['start']; b = 5 * 3600 + best['end']
@@ -3686,10 +3745,13 @@ class Main(QMainWindow):
             self.passenger_lbl.setText(str(class_totals['passenger']))
             self.suv_lbl.setText(str(class_totals['4x4']))
             self.refresh_production_hours()
-        self._flow_value = float(metrics["flow_per_minute"]) if not test_mode else None
-        self._flow_monitoring = bool(not test_mode and worker is not None and
-            worker.source_kind == "oak" and worker.isRunning() and
-            metrics["no_count_status"] in ("RUNNING", "NO COUNT", "WAITING"))
+        if test_mode:
+            self._flow_value = float(self.flow_lbl.text().split()[0].split("/")[0])
+            self._flow_monitoring = bool(worker is not None and worker.isRunning())
+        else:
+            self._flow_value = float(metrics["flow_per_minute"])
+            self._flow_monitoring = bool(worker is not None and worker.source_kind == "oak"
+                and worker.isRunning() and metrics["no_count_status"] in ("RUNNING", "NO COUNT", "WAITING"))
         if time.monotonic() >= getattr(self, "_next_history_refresh", 0):
             self._next_history_refresh = time.monotonic() + 30
             self.refresh_best_day()
@@ -3900,10 +3962,39 @@ class Main(QMainWindow):
             )
             self.email_thread.start()
 
+    def play_alert(self, kind, test=False):
+        enabled = self.operator_settings.get(
+            "low_flow_sound_enabled" if kind == "low" else "best_hour_sound_enabled", True)
+        if enabled or test:
+            threading.Thread(target=play_windows_alert,
+                             args=(kind, self.operator_settings.get("alert_volume", 75)),
+                             daemon=True).start()
+
+    def check_best_hour_celebration(self, count, test_mode):
+        source = "video" if test_mode else "oak"
+        previous = self._best_hour_seen[source]
+        self._best_hour_seen[source] = count if previous is None else max(previous, count)
+        # Do not celebrate historical records loaded at startup.
+        if previous is not None and count > previous and count > 0:
+            self.play_alert("best")
+            self._best_flash_until = time.monotonic() + 4
+
     def flash_low_flow(self):
+        if time.monotonic() < self._best_flash_until:
+            bright = int(time.monotonic() * 3) % 2 == 0
+            self.session_lbl.setStyleSheet(
+                "background:#16A34A;color:white;font-size:38px;font-weight:900;"
+                if bright else "color:#38D996;font-size:38px;font-weight:900;")
+        else:
+            self.session_lbl.setStyleSheet("color:#38D996;font-size:38px;font-weight:900;")
         if not getattr(self, "_flow_monitoring", False) or getattr(self, "_flow_value", 999) > self.operator_settings["low_flow_threshold"]:
             self.flow_lbl.setStyleSheet("")
+            self._low_flow_last_sound = 0.0
             return
+        now = time.monotonic()
+        if now - self._low_flow_last_sound >= 60:
+            self._low_flow_last_sound = now
+            self.play_alert("low")
         self._flow_flash = not self._flow_flash
         self.flow_lbl.setStyleSheet(
             "background:#B91C1C;color:white;font-size:22px;font-weight:900;"
