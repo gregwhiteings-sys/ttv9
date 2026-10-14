@@ -138,7 +138,7 @@ V48_AGNOSTIC_NMS = True
 
 
 # Target up to 20 live-preview updates/second, independently of inference.
-OAK_PREVIEW_INTERVAL_MS = 50
+OAK_PREVIEW_INTERVAL_MS = 67
 
 # Draw the detector geometry faithfully; cosmetic shrinking does not improve detection.
 VISUAL_BOX_INSET = 0.0
@@ -1037,7 +1037,7 @@ class OakSource:
         self.segment_started = None
         self.segment_path = None
         self.segment_frames = 0
-        self.capture_fps = 20.0
+        self.capture_fps = 15.0
         self.previous_camera_sequence = None
 
         pipeline = dai.Pipeline()
@@ -1048,7 +1048,7 @@ class OakSource:
         )
         camera.setPreviewSize(480, 270)
         camera.setInterleaved(False)
-        camera.setFps(20)
+        camera.setFps(15)
 
         output = pipeline.create(dai.node.XLinkOut)
         output.setStreamName("rgb")
@@ -1064,7 +1064,7 @@ class OakSource:
 
             self.queue = self.device.getOutputQueue(
                 "rgb",
-                maxSize=4,
+                maxSize=1,
                 blocking=False,
             )
 
@@ -1745,7 +1745,7 @@ class CounterWorker(QThread):
                             f"vote:{class_score:.0%}"
                         )
 
-                        if self.show_tyre_labels:
+                        if self.show_tyre_labels and self.source_kind != "oak":
                             cv2.putText(
                                 frame,
                                 label,
@@ -2285,6 +2285,14 @@ class Main(QMainWindow):
         self.clock = QTimer(self)
         self.clock.timeout.connect(self.tick)
         self.clock.start(1000)
+        self._auto_stop_date = None
+        self._auto_suppress_date = None
+        self._auto_retry_after = 0.0
+        self._auto_start_attempt_date = None
+        # Auto-shift is enabled by default, but can be disabled in the CAMERA tab.
+        self._auto_enabled = self.auto_shift_checkbox.isChecked()
+        # Set source for unattended startup; manual selections remain available.
+        self.source_combo.setCurrentText(OAK_NAME)
         self.tick()
 
     def card(self, heading):
@@ -2620,6 +2628,25 @@ class Main(QMainWindow):
         source_layout.addWidget(
             self.record_oak_checkbox
         )
+        self.auto_shift_checkbox = QCheckBox(
+            "Automatic OAK shift (05:00–17:05 Brisbane daily)"
+        )
+        try:
+            self._auto_shift_preference = json.loads(
+                (DATA / "auto_shift_settings.json").read_text(encoding="utf-8")
+            ).get("enabled", True)
+        except (OSError, ValueError, AttributeError):
+            self._auto_shift_preference = True
+        self.auto_shift_checkbox.setChecked(bool(self._auto_shift_preference))
+        self.auto_shift_checkbox.setToolTip(
+            "Start counting automatically during the Brisbane shift; "
+            "stop at 17:05. Windows must launch TyreTrack first."
+        )
+        self.auto_shift_checkbox.toggled.connect(
+            self.update_auto_shift_enabled
+        )
+        source_layout.addWidget(self.auto_shift_checkbox)
+
         self.overlay_mode_combo = QComboBox()
         self.overlay_mode_combo.addItems(["None", "Bounding Boxes", "Segmentation Mask"])
         self.overlay_mode_combo.setCurrentText("None")
@@ -3000,6 +3027,19 @@ class Main(QMainWindow):
             """
         )
 
+    def update_auto_shift_enabled(self, enabled):
+        self._auto_enabled = bool(enabled)
+        try:
+            (DATA / "auto_shift_settings.json").write_text(
+                json.dumps({"enabled": self._auto_enabled}, indent=2),
+                encoding="utf-8"
+            )
+        except OSError as exc:
+            log(f"AUTO SHIFT: preference save failed: {exc}")
+        log("AUTO SHIFT: " + ("enabled" if enabled else "disabled"))
+        if enabled:
+            self._auto_retry_after = 0.0
+
     def update_overlay_mode(self, mode):
         worker = getattr(self, "worker", None)
         if worker is not None:
@@ -3214,20 +3254,16 @@ class Main(QMainWindow):
             return
 
         detections = ()
+        overlay = None
         mode = self.overlay_mode_combo.currentText()
-        # Clean preview uses newest OAK-D camera frame.
-        # AI counting continues independently.
-        if mode not in ("Bounding Boxes", "Segmentation Mask"):
+        # Restore the inference-matched frame for overlays (V9.2 rollback).
+        overlay = worker.latest_oak_overlay()
+        if overlay is not None:
+            captured_at, sequence, dimensions, detections, processed_frame, result = overlay
+            frame = processed_frame.copy()
+        else:
             frame, sequence, captured_at = worker.oak_source.preview_snapshot()
             result = None
-        else:
-            overlay = worker.latest_oak_overlay()
-            if overlay is not None:
-                captured_at, sequence, dimensions, detections, processed_frame, result = overlay
-                frame = processed_frame.copy()
-            else:
-                frame, sequence, captured_at = worker.oak_source.preview_snapshot()
-                result = None
         if frame is None or sequence == self._oak_preview_sequence:
             return
         self._oak_preview_sequence = sequence
@@ -3236,6 +3272,23 @@ class Main(QMainWindow):
             draw_detections(frame, detections)
         elif mode == "Segmentation Mask" and result is not None:
             v481_draw_masks(frame, result)
+
+        # The label checkbox is independent of the overlay dropdown.
+        # This runs on every GUI refresh, including mid-session changes.
+        if self.show_tyre_labels.isChecked() and overlay is not None:
+            for x1, y1, x2, y2, track_id, confidence in detections:
+                tyre_type, score = tyre_class_vote(
+                    worker.class_votes.get(track_id, {})
+                )
+                title = ("PASSENGER" if tyre_type == "passenger"
+                         else "SUV / 4X4" if tyre_type == "4x4"
+                         else "UNCLASSIFIED")
+                cv2.putText(
+                    frame, f"{title} ID:{track_id} vote:{score:.0%}",
+                    (max(0, x1), max(20, y1 - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48,
+                    (255, 180, 40), 1, cv2.LINE_AA
+                )
 
         draw_line_and_total(
             frame,
@@ -3542,6 +3595,8 @@ class Main(QMainWindow):
             QMessageBox.information(self, "Stop cancelled", "A reason is required.")
             return
         self.record_admin_stop("STOP COUNTING", reason.strip())
+        # A deliberate admin stop must not be immediately undone by auto-start.
+        self._auto_suppress_date = brisbane_now().date()
         self.stop()
 
     def record_admin_stop(self, action, reason):
@@ -3924,7 +3979,44 @@ class Main(QMainWindow):
         self.line_length.setValue(100)
         self.line_changed()
 
+    def check_automatic_shift(self):
+        """Automatically run OAK counting from 05:00 to 17:05 Brisbane time.
+
+        Windows must be running and this app must have been launched.
+        Manual stop suppresses restarts until the following Brisbane day.
+        """
+        if not self._auto_enabled:
+            return
+        now = brisbane_now()
+        today = now.date()
+        minute = now.hour * 60 + now.minute
+        worker = self.worker
+        active = worker is not None and worker.isRunning()
+        is_oak = active and worker.source_kind == "oak"
+
+        if minute >= 17 * 60 + 5 or minute < 5 * 60:
+            if is_oak and self._auto_stop_date != today:
+                self._auto_stop_date = today
+                log("AUTO SHIFT: 17:05 Brisbane cutoff; stopping OAK counting")
+                self.stop()
+            return
+
+        if active or self._auto_suppress_date == today:
+            return
+        if time.monotonic() < self._auto_retry_after:
+            return
+        # Avoid overlapping an old worker thread that is still shutting down.
+        if worker is not None and not worker.isFinished():
+            return
+        self._auto_retry_after = time.monotonic() + 60
+        self.source_combo.setCurrentText(OAK_NAME)
+        log("AUTO SHIFT: starting OAK counting (Brisbane 05:00–17:05)")
+        self.start()
+        if self.worker is None or not self.worker.isRunning():
+            log("AUTO SHIFT: start pending or failed; retry after 60 seconds")
+
     def tick(self):
+        self.check_automatic_shift()
         # Outbound cloud sync runs only for a live OAK session, never recorded-video tests.
         if (self.worker is not None and self.worker.source_kind == "oak" and self.worker.isRunning()
                 and time.monotonic() >= getattr(self, "_cloud_next_at", 0)):
