@@ -129,7 +129,8 @@ MODEL_NAME = "tyre_detector.pt"
 OAK_NAME = "OAK-D S2 PoE / CAT5"
 
 IOU_DEFAULT = 0.50
-INFERENCE_SIZE = 480
+INFERENCE_SIZE = int(os.environ.get("TYRETRACK_INFERENCE_SIZE", "384"))
+# N5030 trial: 384 versus previous 480. Validate counts on the same video.
 
 # V4.8 counting configuration
 V48_HYSTERESIS_PX = 5
@@ -973,19 +974,13 @@ def draw_line_and_total(
     )
     cv2.putText(
         frame,
-        "FRONT LINE" if end_ratio is not None else "COUNT LINE",
+        "COUNT LINE",
         (18, max(32, round(line_y) - 12)),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.75,
         yellow,
         2,
     )
-    if end_ratio is not None:
-        el,er,ey,es=segment_bounds(width,height,end_ratio,line_angle,line_length)
-        cv2.line(frame,(round(el),round(ey+es*(el-centre_x))),
-                 (round(er),round(ey+es*(er-centre_x))),(255,200,0),3)
-        cv2.putText(frame,"END LINE",(18,max(32,round(ey)-12)),
-                    cv2.FONT_HERSHEY_SIMPLEX,.65,(255,200,0),2)
     # Small, content-sized video overlay; counting logic is unchanged.
     total_text = f"TOTAL {total}"
     font = cv2.FONT_HERSHEY_SIMPLEX
@@ -1039,6 +1034,8 @@ class OakSource:
         self.segment_frames = 0
         self.capture_fps = 15.0
         self.previous_camera_sequence = None
+        self.sequence_gap_total = 0
+        self.sequence_gap_last_log = time.monotonic()
 
         pipeline = dai.Pipeline()
         camera = pipeline.create(dai.node.ColorCamera)
@@ -1149,13 +1146,14 @@ class OakSource:
                         previous is not None
                         and camera_sequence > previous + 1
                     ):
-                        log(
-                            "OAK recording WARNING: "
-                            f"{camera_sequence - previous - 1} "
-                            "camera frames were not received"
-                        )
+                        self.sequence_gap_total += camera_sequence - previous - 1
 
                     self.previous_camera_sequence = camera_sequence
+                    if time.monotonic() - self.sequence_gap_last_log >= 30:
+                        if self.sequence_gap_total:
+                            log(f"OAK camera sequence gaps (30s): {self.sequence_gap_total} frames")
+                        self.sequence_gap_total = 0
+                        self.sequence_gap_last_log = time.monotonic()
                 except Exception:
                     pass
 
@@ -1424,7 +1422,7 @@ def v481_draw_masks(frame, result, opacity=0.38, id_offset=0, show_labels=False)
 class CounterWorker(QThread):
     frame_ready = pyqtSignal(object)
     counted = pyqtSignal(int, float)
-    line_progress = pyqtSignal(int, int, int)
+    line_progress = pyqtSignal(int)
     status = pyqtSignal(str)
     finished_clean = pyqtSignal()
 
@@ -1459,7 +1457,7 @@ class CounterWorker(QThread):
         )
 
         self.end_ratio = max(.10,min(.90,float(end_ratio)))
-        self.line_ids = [set(), set()]
+        self.line_ids = [set()]
         self.running = True
         self.session_count = 0
         self.counted_ids = set()
@@ -1478,9 +1476,6 @@ class CounterWorker(QThread):
         self.confirmed_ids = set()
         self.last_seen_frame = {}
         self.processing_frame = 0
-        # Diagnostic only: indicates that YOLO inference is completing.
-        # Does not alter detection, tracking, counting or model settings.
-        self.last_inference_at = None
         self.video_fps = 20.0
         self.tracker_recoveries = 0
         self.oak_source = None
@@ -1495,8 +1490,7 @@ class CounterWorker(QThread):
         self.oak_overlay = None
 
     def line_totals(self):
-        return (len(self.line_ids[0]),len(self.line_ids[1]),
-                len(self.line_ids[0] & self.line_ids[1]))
+        return len(self.line_ids[0])
 
     def stop(self):
         self.running = False
@@ -1519,6 +1513,11 @@ class CounterWorker(QThread):
                 )
 
             self.status.emit("Loading tyre detector...")
+            try:
+                import torch
+                torch.set_num_threads(int(os.environ.get("TYRETRACK_TORCH_THREADS", "2")))
+            except Exception as exc:
+                log(f"Torch thread tuning skipped: {exc}")
             model = YOLO(str(model_path))
 
             if self.source_kind == "oak":
@@ -1649,7 +1648,6 @@ class CounterWorker(QThread):
                     time.monotonic() - started
                 )
                 perf_frames += 1
-                self.last_inference_at = time.monotonic()
 
                 detections = []
 
@@ -1764,7 +1762,7 @@ class CounterWorker(QThread):
 
 
                         changed = False
-                        for line_index, ratio in enumerate((self.line_ratio,self.end_ratio)):
+                        for line_index, ratio in enumerate((self.line_ratio,)):
                             ll,rr,ly,ls=segment_bounds(width,height,ratio,self.line_angle,self.line_length)
                             side=counting_y-(ly+ls*(cx-centre_x))
                             key=(line_index,track_id)
@@ -1813,13 +1811,13 @@ class CounterWorker(QThread):
                                 self.previous_x[key]=cx
                                 self.previous_observation_frame[key]=self.processing_frame
                         if changed:
-                            self.line_progress.emit(*self.line_totals())
+                            self.line_progress.emit(self.line_totals())
 
                 # Retire stale positions after 90 processed frames, not wall time.
                 # Keep counted IDs for the entire session to prevent repeat counts.
                 for track_id, seen in list(self.last_seen_frame.items()):
                     if self.processing_frame-seen > 90:
-                        for index in (0,1):
+                        for index in (0,):
                             self.previous_side.pop((index,track_id), None)
                             self.previous_x.pop((index,track_id), None)
                             self.previous_observation_frame.pop((index,track_id), None)
@@ -1850,7 +1848,7 @@ class CounterWorker(QThread):
                         self.line_angle,
                         self.line_length,
                         self.session_count,
-                        self.end_ratio, self.line_totals(),
+                        None, None,
                     )
                     if self.review_writer is not None:
                         self.review_writer.write(frame)
@@ -1929,7 +1927,7 @@ class VideoLabel(QLabel):
         self.line_ratio = 0.59
         self.line_angle = 0
         self.line_length = 1.0
-        self.end_line_ratio = .30
+        self.end_line_ratio = None
         self.editable = True
         self.drag_mode = None
         self.setCursor(Qt.CrossCursor)
@@ -2039,15 +2037,6 @@ class VideoLabel(QLabel):
                 14,
                 14,
             )
-        geometry=self.image_geometry()
-        if geometry is not None:
-            ox,oy,_,_,scale=geometry
-            w,h=self._pix.width(),self._pix.height()
-            ll,rr,ly,ls=segment_bounds(w,h,self.end_line_ratio,self.line_angle,self.line_length)
-            centre=(w-1)/2
-            painter.setPen(QPen(QColor("#00c8ff"),3))
-            painter.drawLine(round(ox+ll*scale),round(oy+(ly+ls*(ll-centre))*scale),
-                             round(ox+rr*scale),round(oy+(ly+ls*(rr-centre))*scale))
         painter.end()
 
     def mousePressEvent(self, event):
@@ -2292,10 +2281,7 @@ class Main(QMainWindow):
         self._auto_stop_date = None
         self._auto_suppress_date = None
         self._auto_retry_after = 0.0
-        self._auto_connect_pending = False
-        self._auto_session = False
         self._auto_start_attempt_date = None
-        self._inference_stall_warned = False
         # Auto-shift is enabled by default, but can be disabled in the CAMERA tab.
         self._auto_enabled = self.auto_shift_checkbox.isChecked()
         # Set source for unattended startup; manual selections remain available.
@@ -2823,29 +2809,15 @@ class Main(QMainWindow):
         for button in self.line_buttons:
             line_buttons.addWidget(button)
 
-        self.end_line_pos = QSlider(Qt.Horizontal)
-        self.end_line_pos.setRange(10,90)
-        try:
-            end_position=round(float(get_state("end_line_ratio","0.30"))*100)
-        except (ValueError,TypeError):
-            end_position=30
-        self.end_line_pos.setValue(end_position)
-        self.end_line_lbl = QLabel()
-        line_layout.addWidget(QLabel("End line position (shares front-line angle and length)"))
-        line_layout.addWidget(self.end_line_pos)
-        line_layout.addWidget(self.end_line_lbl)
-        self.end_line_pos.valueChanged.connect(self.line_changed)
-        self.line_totals_lbl = QLabel("Front 0 | End 0 | Both 0 | Final 0")
-        self.line_totals_lbl.setWordWrap(True)
+        self.line_totals_lbl = QLabel("Count line crossings: 0")
         line_layout.addWidget(self.line_totals_lbl)
         line_layout.addLayout(line_buttons)
         line_tab.addWidget(line_card)
 
         hint = QLabel(
             "Stop counting to adjust the line. "
-            "Drag the yellow front line to move it; drag either end "
-            "to shorten or tilt it. Set the blue end line with its position slider. "
-            "Final counts each ID once at either line; Both shows confirmation at both."
+            "Drag the yellow count line to move it; drag either end "
+            "to shorten or tilt it. Each tracked tyre counts once."
         )
         hint.setWordWrap(True)
         line_tab.addWidget(hint)
@@ -3263,21 +3235,14 @@ class Main(QMainWindow):
         detections = ()
         overlay = None
         mode = self.overlay_mode_combo.currentText()
-        # Low-power N5030 optimization: the clean camera preview is independent
-        # of YOLO. Never make an unannotated preview wait for inference.
-        # For AI overlays, use ONLY the exact frame processed by YOLO so boxes
-        # and segmentation masks cannot be drawn on a different camera frame.
-        need_ai_view = (mode != "None" or self.show_tyre_labels.isChecked())
-        result = None
-        if need_ai_view:
-            overlay = worker.latest_oak_overlay()
-            if overlay is not None:
-                captured_at, sequence, dimensions, detections, processed_frame, result = overlay
-                frame = processed_frame.copy()
-            else:
-                frame, sequence, captured_at = worker.oak_source.preview_snapshot()
+        # Restore the inference-matched frame for overlays (V9.2 rollback).
+        overlay = worker.latest_oak_overlay()
+        if overlay is not None:
+            captured_at, sequence, dimensions, detections, processed_frame, result = overlay
+            frame = processed_frame.copy()
         else:
             frame, sequence, captured_at = worker.oak_source.preview_snapshot()
+            result = None
         if frame is None or sequence == self._oak_preview_sequence:
             return
         self._oak_preview_sequence = sequence
@@ -3436,7 +3401,6 @@ class Main(QMainWindow):
             self.line_pos,
             self.line_angle,
             self.line_length,
-            self.end_line_pos,
         ):
             slider.setEnabled(
                 not running
@@ -3447,14 +3411,7 @@ class Main(QMainWindow):
                 not running
             )
 
-    def start(self, automatic=False):
-        # Automatic OAK starts never display blocking error dialogs.
-        # Manual starts retain normal error feedback.
-        self._auto_connect_pending = bool(automatic)
-        if automatic:
-            self._auto_session = True
-        else:
-            self._auto_session = False
+    def start(self):
         if (
             self.worker is not None
             and self.worker.isRunning()
@@ -3466,11 +3423,9 @@ class Main(QMainWindow):
             return
 
         try:
-            if abs(self.line_pos.value()-self.end_line_pos.value()) < 3:
-                raise ValueError("Place the front and end lines at least 3% apart.")
             self.session = 0
             self.test_events = []
-            self.line_totals_lbl.setText("Front 0 | End 0 | Both 0 | Final 0")
+            self.line_totals_lbl.setText("Count line crossings: 0")
             self.refresh_counts()
 
             worker = CounterWorker(
@@ -3482,7 +3437,7 @@ class Main(QMainWindow):
                 self.line_pos.value() / 100.0,
                 self.line_angle.value(),
                 self.line_length.value() / 100.0,
-                self.end_line_pos.value() / 100.0,
+                None,
             )
             worker.overlay_mode = self.overlay_mode_combo.currentText()
             worker.show_tyre_labels = (
@@ -3522,21 +3477,11 @@ class Main(QMainWindow):
                 + traceback.format_exc()
             )
             self.set_running_controls(False)
-            if automatic:
-                self._auto_connect_pending = False
-                self._auto_retry_after = time.monotonic() + 60
-                self.status_lbl.setText(
-                    "CAMERA OFFLINE – RETRYING IN 60 SECONDS"
-                )
-                self.health.setText("● CAMERA OFFLINE – RETRYING")
-                self.health.setStyleSheet("color:#ffb16b")
-                log(f"AUTO SHIFT: startup failed; retry scheduled: {exc}")
-            else:
-                QMessageBox.critical(
-                    self,
-                    "Start Failed",
-                    str(exc),
-                )
+            QMessageBox.critical(
+                self,
+                "Start Failed",
+                str(exc),
+            )
 
     def admin_auth(self, action):
         password, ok = QInputDialog.getText(
@@ -3628,7 +3573,6 @@ class Main(QMainWindow):
         self.record_admin_stop("STOP COUNTING", reason.strip())
         # A deliberate admin stop must not be immediately undone by auto-start.
         self._auto_suppress_date = brisbane_now().date()
-        self._auto_session = False
         self.stop()
 
     def record_admin_stop(self, action, reason):
@@ -3652,23 +3596,6 @@ class Main(QMainWindow):
     def worker_done(self):
         self.oak_preview_timer.stop()
         self.set_running_controls(False)
-        # A failed automatic connection must not block the Qt event loop.
-        # check_automatic_shift will retry after its 60-second backoff.
-        if self._auto_session:
-            self._auto_connect_pending = False
-            self._auto_retry_after = max(
-                self._auto_retry_after, time.monotonic() + 60
-            )
-            now = brisbane_now()
-            minute = now.hour * 60 + now.minute
-            if (self._auto_enabled
-                    and 5 * 60 <= minute < 17 * 60 + 5
-                    and self._auto_suppress_date != now.date()):
-                self.status_lbl.setText(
-                    "CAMERA OFFLINE – RETRYING IN 60 SECONDS"
-                )
-                self.health.setText("● CAMERA OFFLINE – RETRYING")
-                self.health.setStyleSheet("color:#ffb16b")
 
     def on_status(self, status):
         messages = {
@@ -3684,28 +3611,20 @@ class Main(QMainWindow):
         )
 
         if status.startswith("ERROR:"):
-            if self._auto_session:
-                log("AUTO SHIFT: OAK connection failed (silent retry): "
-                    + status[6:].strip())
-                self._auto_retry_after = time.monotonic() + 60
-                self.status_lbl.setText(
-                    "CAMERA OFFLINE – RETRYING IN 60 SECONDS"
-                )
-                self.health.setText("● CAMERA OFFLINE – RETRYING")
-                self.health.setStyleSheet("color:#ffb16b")
-            else:
-                self.health.setText("● CHECK SYSTEM")
-                self.health.setStyleSheet("color:#ff9b9b")
-                QMessageBox.critical(
-                    self,
-                    "TYRETRACK - System Error",
-                    status[6:].strip()
-                    + "\n\nFull details: "
-                    + str(LOG),
-                )
+            self.health.setText(
+                "● CHECK SYSTEM"
+            )
+            self.health.setStyleSheet(
+                "color:#ff9b9b"
+            )
+            QMessageBox.critical(
+                self,
+                "TYRETRACK - System Error",
+                status[6:].strip()
+                + "\n\nFull details: "
+                + str(LOG),
+            )
         elif status == "COUNTING":
-            # Connection established: retain automatic restart eligibility for
-            # unexpected camera disconnects later in the shift.
             self.health.setText(
                 "● COUNTING"
             )
@@ -3718,9 +3637,8 @@ class Main(QMainWindow):
             )
             self.health.setStyleSheet("")
 
-    def on_line_progress(self,front,end,both):
-        self.line_totals_lbl.setText(
-            f"Front {front} | End {end} | Both {both} | Final {front+end-both}")
+    def on_line_progress(self, count):
+        self.line_totals_lbl.setText(f"Count line crossings: {count}")
 
     def on_count(self, _track_id, _confidence):
         # Already committed to SQLite in CounterWorker.
@@ -3909,9 +3827,9 @@ class Main(QMainWindow):
         if self.worker is not None:
             self.worker.session_count = 0
             self.worker.session_type_counts = {"passenger": 0, "4x4": 0, "unknown": 0}
-            self.worker.line_ids = [set(), set()]
+            self.worker.line_ids = [set()]
             self.worker.counted_ids.clear()
-        self.line_totals_lbl.setText("Front 0 | End 0 | Both 0 | Final 0")
+        self.line_totals_lbl.setText("Count line crossings: 0")
         self.refresh_counts()
 
     def export_results(self):
@@ -4010,11 +3928,6 @@ class Main(QMainWindow):
             f"Length: {self.line_length.value()}%"
         )
 
-        if hasattr(self,"end_line_pos"):
-            end_ratio=self.end_line_pos.value()/100.0
-            self.end_line_lbl.setText(f"End position: {self.end_line_pos.value()}%")
-            self.video.end_line_ratio=end_ratio
-            set_state("end_line_ratio",end_ratio)
         self.video.line_ratio = ratio
         self.video.line_angle = angle
         self.video.line_length = length
@@ -4068,29 +3981,12 @@ class Main(QMainWindow):
         self._auto_retry_after = time.monotonic() + 60
         self.source_combo.setCurrentText(OAK_NAME)
         log("AUTO SHIFT: starting OAK counting (Brisbane 05:00–17:05)")
-        self.start(automatic=True)
+        self.start()
         if self.worker is None or not self.worker.isRunning():
             log("AUTO SHIFT: start pending or failed; retry after 60 seconds")
 
     def tick(self):
         self.check_automatic_shift()
-        # Alert on a genuinely stalled inference worker; never restart or
-        # reset the tracker automatically (that could cause duplicate counts).
-        worker = self.worker
-        if (worker is not None and worker.isRunning()
-                and worker.source_kind == "oak"
-                and worker.oak_source is not None):
-            last = worker.last_inference_at
-            if last is not None:
-                stalled = time.monotonic() - last > 12
-                if stalled and not self._inference_stall_warned:
-                    log("OAK WARNING: YOLO inference has not completed for "
-                        "over 12 seconds; counting may be stalled")
-                    self.health.setText("● AI PROCESSING STALLED")
-                    self.health.setStyleSheet("color:#ff9b9b")
-                self._inference_stall_warned = stalled
-        else:
-            self._inference_stall_warned = False
         # Outbound cloud sync runs only for a live OAK session, never recorded-video tests.
         if (self.worker is not None and self.worker.source_kind == "oak" and self.worker.isRunning()
                 and time.monotonic() >= getattr(self, "_cloud_next_at", 0)):
