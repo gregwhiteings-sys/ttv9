@@ -3263,14 +3263,21 @@ class Main(QMainWindow):
         detections = ()
         overlay = None
         mode = self.overlay_mode_combo.currentText()
-        # Restore the inference-matched frame for overlays (V9.2 rollback).
-        overlay = worker.latest_oak_overlay()
-        if overlay is not None:
-            captured_at, sequence, dimensions, detections, processed_frame, result = overlay
-            frame = processed_frame.copy()
+        # Low-power N5030 optimization: the clean camera preview is independent
+        # of YOLO. Never make an unannotated preview wait for inference.
+        # For AI overlays, use ONLY the exact frame processed by YOLO so boxes
+        # and segmentation masks cannot be drawn on a different camera frame.
+        need_ai_view = (mode != "None" or self.show_tyre_labels.isChecked())
+        result = None
+        if need_ai_view:
+            overlay = worker.latest_oak_overlay()
+            if overlay is not None:
+                captured_at, sequence, dimensions, detections, processed_frame, result = overlay
+                frame = processed_frame.copy()
+            else:
+                frame, sequence, captured_at = worker.oak_source.preview_snapshot()
         else:
             frame, sequence, captured_at = worker.oak_source.preview_snapshot()
-            result = None
         if frame is None or sequence == self._oak_preview_sequence:
             return
         self._oak_preview_sequence = sequence
