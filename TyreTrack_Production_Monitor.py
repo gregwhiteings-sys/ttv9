@@ -2288,6 +2288,8 @@ class Main(QMainWindow):
         self._auto_stop_date = None
         self._auto_suppress_date = None
         self._auto_retry_after = 0.0
+        self._auto_connect_pending = False
+        self._auto_session = False
         self._auto_start_attempt_date = None
         # Auto-shift is enabled by default, but can be disabled in the CAMERA tab.
         self._auto_enabled = self.auto_shift_checkbox.isChecked()
@@ -3433,7 +3435,14 @@ class Main(QMainWindow):
                 not running
             )
 
-    def start(self):
+    def start(self, automatic=False):
+        # Automatic OAK starts never display blocking error dialogs.
+        # Manual starts retain normal error feedback.
+        self._auto_connect_pending = bool(automatic)
+        if automatic:
+            self._auto_session = True
+        else:
+            self._auto_session = False
         if (
             self.worker is not None
             and self.worker.isRunning()
@@ -3501,11 +3510,21 @@ class Main(QMainWindow):
                 + traceback.format_exc()
             )
             self.set_running_controls(False)
-            QMessageBox.critical(
-                self,
-                "Start Failed",
-                str(exc),
-            )
+            if automatic:
+                self._auto_connect_pending = False
+                self._auto_retry_after = time.monotonic() + 60
+                self.status_lbl.setText(
+                    "CAMERA OFFLINE – RETRYING IN 60 SECONDS"
+                )
+                self.health.setText("● CAMERA OFFLINE – RETRYING")
+                self.health.setStyleSheet("color:#ffb16b")
+                log(f"AUTO SHIFT: startup failed; retry scheduled: {exc}")
+            else:
+                QMessageBox.critical(
+                    self,
+                    "Start Failed",
+                    str(exc),
+                )
 
     def admin_auth(self, action):
         password, ok = QInputDialog.getText(
@@ -3597,6 +3616,7 @@ class Main(QMainWindow):
         self.record_admin_stop("STOP COUNTING", reason.strip())
         # A deliberate admin stop must not be immediately undone by auto-start.
         self._auto_suppress_date = brisbane_now().date()
+        self._auto_session = False
         self.stop()
 
     def record_admin_stop(self, action, reason):
@@ -3620,6 +3640,23 @@ class Main(QMainWindow):
     def worker_done(self):
         self.oak_preview_timer.stop()
         self.set_running_controls(False)
+        # A failed automatic connection must not block the Qt event loop.
+        # check_automatic_shift will retry after its 60-second backoff.
+        if self._auto_session:
+            self._auto_connect_pending = False
+            self._auto_retry_after = max(
+                self._auto_retry_after, time.monotonic() + 60
+            )
+            now = brisbane_now()
+            minute = now.hour * 60 + now.minute
+            if (self._auto_enabled
+                    and 5 * 60 <= minute < 17 * 60 + 5
+                    and self._auto_suppress_date != now.date()):
+                self.status_lbl.setText(
+                    "CAMERA OFFLINE – RETRYING IN 60 SECONDS"
+                )
+                self.health.setText("● CAMERA OFFLINE – RETRYING")
+                self.health.setStyleSheet("color:#ffb16b")
 
     def on_status(self, status):
         messages = {
@@ -3635,20 +3672,28 @@ class Main(QMainWindow):
         )
 
         if status.startswith("ERROR:"):
-            self.health.setText(
-                "● CHECK SYSTEM"
-            )
-            self.health.setStyleSheet(
-                "color:#ff9b9b"
-            )
-            QMessageBox.critical(
-                self,
-                "TYRETRACK - System Error",
-                status[6:].strip()
-                + "\n\nFull details: "
-                + str(LOG),
-            )
+            if self._auto_session:
+                log("AUTO SHIFT: OAK connection failed (silent retry): "
+                    + status[6:].strip())
+                self._auto_retry_after = time.monotonic() + 60
+                self.status_lbl.setText(
+                    "CAMERA OFFLINE – RETRYING IN 60 SECONDS"
+                )
+                self.health.setText("● CAMERA OFFLINE – RETRYING")
+                self.health.setStyleSheet("color:#ffb16b")
+            else:
+                self.health.setText("● CHECK SYSTEM")
+                self.health.setStyleSheet("color:#ff9b9b")
+                QMessageBox.critical(
+                    self,
+                    "TYRETRACK - System Error",
+                    status[6:].strip()
+                    + "\n\nFull details: "
+                    + str(LOG),
+                )
         elif status == "COUNTING":
+            # Connection established: retain automatic restart eligibility for
+            # unexpected camera disconnects later in the shift.
             self.health.setText(
                 "● COUNTING"
             )
@@ -4011,7 +4056,7 @@ class Main(QMainWindow):
         self._auto_retry_after = time.monotonic() + 60
         self.source_combo.setCurrentText(OAK_NAME)
         log("AUTO SHIFT: starting OAK counting (Brisbane 05:00–17:05)")
-        self.start()
+        self.start(automatic=True)
         if self.worker is None or not self.worker.isRunning():
             log("AUTO SHIFT: start pending or failed; retry after 60 seconds")
 
