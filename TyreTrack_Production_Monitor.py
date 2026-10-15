@@ -1456,7 +1456,8 @@ class CounterWorker(QThread):
             0.10, min(1.0, float(line_length))
         )
 
-        self.end_ratio = max(.10,min(.90,float(end_ratio)))
+        # Second counting line removed: keep legacy argument harmless.
+        self.end_ratio = None
         self.line_ids = [set()]
         self.running = True
         self.session_count = 0
@@ -3437,7 +3438,6 @@ class Main(QMainWindow):
                 self.line_pos.value() / 100.0,
                 self.line_angle.value(),
                 self.line_length.value() / 100.0,
-                None,
             )
             worker.overlay_mode = self.overlay_mode_combo.currentText()
             worker.show_tyre_labels = (
