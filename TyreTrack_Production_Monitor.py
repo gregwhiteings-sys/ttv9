@@ -1507,13 +1507,23 @@ class CounterWorker(QThread):
         perf_track_seconds = 0.0
 
         try:
-            model_path = resource_path(MODEL_NAME)
-            if not model_path.exists():
-                raise FileNotFoundError(
-                    f"{MODEL_NAME} not found beside the app."
-                )
-
-            self.status.emit("Loading tyre detector...")
+            # Prefer the exported OpenVINO directory when present. The original
+            # PyTorch detector remains a fallback for test/rollback.
+            ov_path = resource_path("tyre_detector_openvino_model")
+            ov_xml = ov_path / "tyre_detector.xml"
+            ov_bin = ov_path / "tyre_detector.bin"
+            if ov_xml.is_file() and ov_bin.is_file():
+                model_path = ov_path
+                detector_backend = "OpenVINO FP32"
+            else:
+                model_path = resource_path(MODEL_NAME)
+                detector_backend = "PyTorch fallback"
+                if not model_path.exists():
+                    raise FileNotFoundError(
+                        "Neither OpenVINO XML/BIN nor tyre_detector.pt was found."
+                    )
+            log(f"Tyre detector backend: {detector_backend}; path={model_path}")
+            self.status.emit(f"Loading tyre detector ({detector_backend})...")
             try:
                 import torch
                 torch.set_num_threads(int(os.environ.get("TYRETRACK_TORCH_THREADS", "2")))
