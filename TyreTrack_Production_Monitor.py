@@ -1478,6 +1478,9 @@ class CounterWorker(QThread):
         self.confirmed_ids = set()
         self.last_seen_frame = {}
         self.processing_frame = 0
+        # Diagnostic only: indicates that YOLO inference is completing.
+        # Does not alter detection, tracking, counting or model settings.
+        self.last_inference_at = None
         self.video_fps = 20.0
         self.tracker_recoveries = 0
         self.oak_source = None
@@ -1646,6 +1649,7 @@ class CounterWorker(QThread):
                     time.monotonic() - started
                 )
                 perf_frames += 1
+                self.last_inference_at = time.monotonic()
 
                 detections = []
 
@@ -2291,6 +2295,7 @@ class Main(QMainWindow):
         self._auto_connect_pending = False
         self._auto_session = False
         self._auto_start_attempt_date = None
+        self._inference_stall_warned = False
         # Auto-shift is enabled by default, but can be disabled in the CAMERA tab.
         self._auto_enabled = self.auto_shift_checkbox.isChecked()
         # Set source for unattended startup; manual selections remain available.
@@ -4062,6 +4067,23 @@ class Main(QMainWindow):
 
     def tick(self):
         self.check_automatic_shift()
+        # Alert on a genuinely stalled inference worker; never restart or
+        # reset the tracker automatically (that could cause duplicate counts).
+        worker = self.worker
+        if (worker is not None and worker.isRunning()
+                and worker.source_kind == "oak"
+                and worker.oak_source is not None):
+            last = worker.last_inference_at
+            if last is not None:
+                stalled = time.monotonic() - last > 12
+                if stalled and not self._inference_stall_warned:
+                    log("OAK WARNING: YOLO inference has not completed for "
+                        "over 12 seconds; counting may be stalled")
+                    self.health.setText("● AI PROCESSING STALLED")
+                    self.health.setStyleSheet("color:#ff9b9b")
+                self._inference_stall_warned = stalled
+        else:
+            self._inference_stall_warned = False
         # Outbound cloud sync runs only for a live OAK session, never recorded-video tests.
         if (self.worker is not None and self.worker.source_kind == "oak" and self.worker.isRunning()
                 and time.monotonic() >= getattr(self, "_cloud_next_at", 0)):
